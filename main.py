@@ -1,7 +1,8 @@
-"""VAE ordinal: el decoder predice una puntuación continua y K-1 umbrales gamma (aprendidos,
-siempre ordenados) definen los cortes entre categorías -- modelo logístico acumulado
-(proportional odds). Compara tres formas de representar la entrada al encoder: one-hot
-nominal, un termómetro fijo, y un embedding ordenado aprendido por categoría.
+"""VAE ordinal: el decoder predice una puntuación continua y K-1 umbrales gamma
+(por defecto fijos, sin aprender) definen los cortes entre categorías -- modelo
+logístico acumulado (proportional odds). El encoder soporta distintas formas de
+representar la entrada (input_mode="onehot"/"termometro"/"embedding"), pero acá
+solo corremos la versión one-hot.
 """
 
 import numpy as np
@@ -9,6 +10,7 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from scipy.interpolate import interp1d
 from scipy.stats import gaussian_kde
 from sklearn.metrics import accuracy_score
 
@@ -33,11 +35,12 @@ loader, tensor = utils.make_loader(scores, K)
 # 2. VAE ordinal: encoder -> (mu, logvar) -> z -> decoder -> puntuación continua s
 
 class OrdinalVAE(nn.Module):
-    def __init__(self, k, hidden=128, latent_dim=1, input_mode="onehot"):
+    def __init__(self, k, hidden=128, latent_dim=1, input_mode="onehot", threshold_mode="aprendido"):
         super().__init__()
         self.k = k
         self.latent_dim = latent_dim
         self.input_mode = input_mode
+        self.threshold_mode = threshold_mode
 
         if input_mode == "onehot":
             input_dim = k
@@ -61,8 +64,17 @@ class OrdinalVAE(nn.Module):
             nn.Linear(hidden, hidden), nn.ELU(),
             nn.Linear(hidden, 1),
         )
-        self.gamma_base = nn.Parameter(torch.zeros(1))
-        self.gamma_deltas = nn.Parameter(torch.zeros(k - 2))
+
+        gamma_base = torch.zeros(1)
+        gamma_deltas = torch.zeros(k - 2)
+        if threshold_mode == "aprendido":
+            self.gamma_base = nn.Parameter(gamma_base)
+            self.gamma_deltas = nn.Parameter(gamma_deltas)
+        elif threshold_mode == "fijo":
+            self.register_buffer("gamma_base", gamma_base)
+            self.register_buffer("gamma_deltas", gamma_deltas)
+        else:
+            raise ValueError(f"threshold_mode desconocido: {threshold_mode}")
 
     def thresholds(self):
         """gamma_1 < ... < gamma_{k-1}, crecientes porque softplus siempre es positivo."""
@@ -146,83 +158,71 @@ def train_vae(vae, loader, n_total, epochs=300, warmup_epochs=100, beta_max=0.5)
             print(f"  epoch {epoch}/{epochs}  beta={beta:.2f}  loss/muestra={total_loss / n_total:.4f}")
 
 
-# 3. entrenamos las 3 variantes de entrada y comparamos
+# 3. entrenamos el VAE ordinal
 
-resultados = {}
-for modo in ["onehot", "termometro", "embedding"]:
-    print(f"\n=== Entrenando VAE ordinal — input_mode='{modo}' ===")
-    vae = OrdinalVAE(k=K, input_mode=modo).to(device)
-    train_vae(vae, loader, N, epochs=300, warmup_epochs=100)
-    vae.eval()
+vae = OrdinalVAE(k=K, input_mode="onehot").to(device)
+train_vae(vae, loader, N, epochs=300, warmup_epochs=100)
+vae.eval()
 
-    gammas = vae.thresholds().detach().cpu().numpy()
-    pred = vae.reconstruct(tensor.to(device))
-    pmf_vae = vae.estimate_pmf()
+gammas = vae.thresholds().detach().cpu().numpy()
+pred = vae.reconstruct(tensor.to(device))
+pmf_vae = vae.estimate_pmf()
+accuracy = accuracy_score(scores, pred)
 
-    resultados[modo] = {
-        "vae": vae,
-        "gammas": gammas,
-        "pred": pred,
-        "pmf_vae": pmf_vae,
-        "accuracy": accuracy_score(scores, pred),
-        "tv": utils.tv_distance(pmf_vae, true_pmf),
-        "wasserstein": utils.wasserstein_pmf(pmf_vae, true_pmf),
-    }
-    print(f"  accuracy={resultados[modo]['accuracy']:.3f}  "
-          f"TV={resultados[modo]['tv']:.4f}  Wasserstein={resultados[modo]['wasserstein']:.4f}")
-
-print("\n=== Comparación de estrategias de codificación de entrada ===")
-print(f'{"input_mode":12} {"Accuracy":>9} {"TV":>8} {"Wasserstein":>12}')
-for modo, r in resultados.items():
-    print(f'{modo:12} {r["accuracy"]:>9.3f} {r["tv"]:>8.4f} {r["wasserstein"]:>12.4f}')
-
-print(f"\nTV/Wasserstein empírica de referencia: "
+print(f"\naccuracy={accuracy:.3f}  "
+      f"TV={utils.tv_distance(pmf_vae, true_pmf):.4f}  "
+      f"Wasserstein={utils.wasserstein_pmf(pmf_vae, true_pmf):.4f}")
+print(f"umbrales gamma: {np.round(gammas, 3).tolist()}")
+print(f"TV/Wasserstein empírica de referencia: "
       f"TV={utils.tv_distance(emp_pmf, true_pmf):.4f}  "
       f"Wasserstein={utils.wasserstein_pmf(emp_pmf, true_pmf):.4f}")
 
 
-# 4. gráficos: PMF, matriz de confusión y densidad latente, por cada input_mode
+# 4. gráficos: PMF, matriz de confusión y densidad latente
 
 x = np.arange(1, K + 1)
 colors = plt.cm.viridis(np.linspace(0, 1, K))
-fig, axes = plt.subplots(3, 3, figsize=(18, 12))
+fig, axes = plt.subplots(1, 3, figsize=(18, 4.5))
 
-for col, modo in enumerate(["onehot", "termometro", "embedding"]):
-    r = resultados[modo]
+axes[0].bar(x - 0.25, true_pmf, width=0.25, label="Verdadera")
+axes[0].bar(x, emp_pmf, width=0.25, label="Empírica")
+axes[0].bar(x + 0.25, pmf_vae, width=0.25, label="VAE")
+axes[0].set_title("PMF"); axes[0].set_xlabel("Valor"); axes[0].set_ylabel("Probabilidad")
+axes[0].legend(fontsize=7)
 
-    ax_pmf = axes[0, col]
-    ax_pmf.bar(x - 0.25, true_pmf, width=0.25, label="Verdadera")
-    ax_pmf.bar(x, emp_pmf, width=0.25, label="Empírica")
-    ax_pmf.bar(x + 0.25, r["pmf_vae"], width=0.25, label="VAE")
-    ax_pmf.set_title(f"PMF — input_mode='{modo}'")
-    ax_pmf.set_xlabel("Valor"); ax_pmf.set_ylabel("Probabilidad"); ax_pmf.legend(fontsize=7)
-
-    cm = utils.matriz_confusion(scores, r["pred"], K)
-    ax_cm = axes[1, col]
-    ax_cm.imshow(cm, cmap="Blues")
-    ax_cm.set_title(f"Reconstrucción — accuracy={r['accuracy']:.3f}")
-    ax_cm.set_xlabel("Predicho"); ax_cm.set_ylabel("Verdadero")
-
-    vae_m, gammas_m = r["vae"], r["gammas"]
-    with torch.no_grad():
-        z_prior = torch.randn(10000, vae_m.latent_dim, device=device)
-        s_samples = vae_m.decoder(z_prior).squeeze(-1).cpu().numpy()
-
-    kde = gaussian_kde(s_samples)
-    s_grid = np.linspace(s_samples.min(), s_samples.max(), 300)
-    densidad_s = kde(s_grid)
-    categoria_por_s = np.searchsorted(gammas_m, s_grid)
-
-    ax_dens = axes[2, col]
-    ax_dens.plot(s_grid, densidad_s, color="black", lw=0.8)
+cm = utils.matriz_confusion(scores, pred, K)
+axes[1].imshow(cm, cmap="Blues")
+for i in range(K):
     for j in range(K):
-        mask = categoria_por_s == j
-        if mask.any():
-            ax_dens.fill_between(s_grid[mask], densidad_s[mask], color=colors[j])
-    for g in gammas_m:
-        ax_dens.axvline(g, color="white", lw=0.6, alpha=0.7)
-    ax_dens.set_title(f"Densidad de s — input_mode='{modo}'")
-    ax_dens.set_xlabel("Puntuación continua s"); ax_dens.set_ylabel("Densidad")
+        axes[1].text(j, i, cm[i, j], ha="center", va="center", fontsize=6)
+axes[1].set_title(f"Reconstrucción — accuracy={accuracy:.3f}")
+axes[1].set_xlabel("Predicho"); axes[1].set_ylabel("Verdadero")
+
+with torch.no_grad():
+    z_prior = torch.randn(10000, vae.latent_dim, device=device)
+    s_samples = vae.decoder(z_prior).squeeze(-1).cpu().numpy()
+
+# continuización: reescalamos s al eje de "Valor" (1..K) anclando cada umbral
+# gamma_j al borde real entre categorías j y j+1 (j + 0.5), para que la densidad
+# quede en la misma escala que la PMF discreta del panel 0.
+bordes_valor = np.arange(1, K) + 0.5
+s_a_valor = interp1d(gammas, bordes_valor, kind="linear", fill_value="extrapolate")
+value_samples = s_a_valor(s_samples)
+
+kde = gaussian_kde(value_samples)
+v_grid = np.linspace(0.5, K + 0.5, 300)
+densidad_v = kde(v_grid)
+categoria_por_v = np.clip(np.searchsorted(bordes_valor, v_grid), 0, K - 1)
+
+axes[2].plot(v_grid, densidad_v, color="black", lw=0.8)
+for j in range(K):
+    mask = categoria_por_v == j
+    if mask.any():
+        axes[2].fill_between(v_grid[mask], densidad_v[mask], color=colors[j])
+for b in bordes_valor:
+    axes[2].axvline(b, color="white", lw=0.6, alpha=0.7)
+axes[2].set_title("Densidad continuizada"); axes[2].set_xlabel("Valor"); axes[2].set_ylabel("Densidad")
+axes[2].set_xlim(x.min() - 0.5, x.max() + 0.5)
 
 plt.tight_layout()
 plt.show()
